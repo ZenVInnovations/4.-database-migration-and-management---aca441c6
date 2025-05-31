@@ -1,0 +1,179 @@
+#!/usr/bin/env ruby
+
+require "thor"
+require "json"
+require "highline"
+require 'wannabe_bool'
+require_relative "../lib/migrate"
+
+include Migrate
+$asker = HighLine.new
+
+class CLI < Thor
+  @@pg_version = "0.18.4"
+  @@mysql_version = "0.4.2"
+
+  method_option :root, {
+    :aliases => "-r",
+    :default => ".",
+    :desc => "Sepcify migration root directory, where config file is located"
+  }
+  method_option :config, {
+    :aliases => "-c",
+    :default => "migrate.conf",
+    :desc => "Specify custom configuration file name"
+  }
+  def initialize(*args)
+    super
+    @config = Conf.new(options["root"], options["config"])
+    init_invoked = ARGV.length > 0 && ARGV[0] == "init"
+
+    if @config.exists?
+      @config.load!
+      CLI.install_deps(@config.storage)
+      @migrator = Migrator.new(@config)
+    elsif not init_invoked
+      Log.error("Configuration not found in `#{Pathname.new(@config.root).expand_path}`. " \
+                "Make sure you are in right directory or " \
+                "run `migrate init` to create configuration.")
+      exit
+    end
+  end
+
+  def self.install_deps(storage)
+    install_dep = ""
+    case storage
+    when "pg"
+      if `gem list -i pg`.to_b != true
+        install_dep = "gem install pg -v #{@@pg_version}"
+        Log.info "pg package not installed. Will install it."
+      end
+    when "mysql"
+      if `gem list -i mysql2`.to_b != "true"
+        install_dep = "gem install mysql2 -v #{@@mysql_version}"
+        Log.info "mysql2 package not installed. Will install it."
+      end
+    end
+
+    unless install_dep.empty?
+      Log.info "Running '#{install_dep}'"
+      unless system(install_dep)
+        raise "Wrror while install dependencies. Please try to run '#{install_dep}' manually and try running 'init' again."
+      else
+        Log.info "Missing dependencies installed"
+      end
+    end
+  end
+
+  desc "init", "make configuration file"
+  def init
+    generated_config = false
+
+    if @migrator == nil
+      Log.info("Creating configuration...")
+      generated_config = true
+
+      storage = nil
+      $asker.choose do |menu|
+        menu.prompt = "Which database do you prefer?"
+
+        menu.choice(:mysql) { storage = "mysql" }
+        menu.choices(:pg) { storage = "pg" }
+      end
+
+      CLI.install_deps(storage)
+
+      db_defaults = case storage
+      when "mysql"
+        { :port => "3306", :user => "root" }
+      when "pg"
+        { :port => "5432", :user => "postgres" }
+      end
+
+      lang = nil
+      $asker.choose do |menu|
+        menu.prompt = "What language would you like use for your migration scripts?"
+
+        menu.choice(:sql) { lang = "sql" }
+        menu.choices(:ruby) { lang = "ruby" }
+        menu.choice(:javascript) { lang = "javascript" }
+        menu.choice(:go) { lang = "go" }
+        menu.choice(:python) { lang = "python" }
+      end
+
+      config = {
+        storage: storage,
+        lang: lang,
+        host: $asker.ask("Host: ") {|q| q.default = "localhost"},
+        port: ($asker.ask("Port: ") {|q| q.default = db_defaults[:port]}).to_i,
+        database: $asker.ask("Database Name: ") {|q| q.default = "mydb"},
+        user: $asker.ask("User: ") {|q| q.default = db_defaults[:user]},
+        password: $asker.ask("Password: ") {|q| q.echo = "x"},
+        version_info: $asker.ask("Version info table: ") {|q| q.default = "version_info"},
+        version_number: $asker.ask("Version number table: ") {|q| q.default = "version_number"}
+      }
+
+      @config.init(config)
+      @config.load!
+      @migrator = Migrator.new(@config)
+    end
+
+    @migrator.init
+    @migrator.recover
+  rescue Exception => e
+    Log.error("Error while initialization.", e)
+    if generated_config
+      @config.delete
+    end
+    exit
+  end
+
+  desc "new [DESCRIPTION]", "generate files for new migration"
+  def new(description="migration")
+    @migrator.new(description)
+  end
+
+  desc "up", "Upgrade database schema"
+  option :to, :aliases => "-t", :desc => "Upgrade to the version"
+  option :all, :aliases => "-a", :type => :boolean, :default => false, :desc => "Execute all up migrations"
+  def up
+    @migrator.up(options[:to], options[:all])
+  rescue VersionNotFound => e
+    Log.error("Next version not found.")
+  rescue Exception => e
+    Log.error("Error while migrating up.", e)
+  end
+
+  desc "down [TO_VERSION]", "Downgrade database schema"
+  option :to, :aliases => "-t", :desc => "Downgrade back to the version"
+  def down
+    @migrator.down(options[:to])
+  rescue VersionNotFound => e
+    Log.error("Previous version not found.")
+  rescue Exception => e
+    Log.error("Error while migrating down.", e)
+  end
+
+  desc "list", "Show list of all migrations"
+  option :limit, :aliases => "-l", :desc => "Limit results"
+  option :select, :aliases => "-s", :desc => "Columns to select"
+  def list()
+    @migrator.list(options[:select], options[:limit])
+  end
+
+  desc "delete [VERSION]", "Will delete migration data"
+  def delete(version)
+    @migrator.delete(version.to_i)
+  rescue VersionNotFound
+    Log.error("Version not found.")
+  rescue Exception => e
+    Log.error("Error while removing migration.", e)
+  end
+
+  desc "version", "Show current version"
+  def version()
+    Log.version(@migrator.current_version())
+  end
+end
+
+CLI.start
